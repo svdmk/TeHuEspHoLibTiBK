@@ -1,0 +1,199 @@
+esphome:
+  name: libretinycht8310
+  # Включваме external C++ файлове
+  # includes:
+  #   - components/soft_i2c.h
+  #   - components/cht8305_driver.h
+  
+  # Действия при boot (I2C scan за debugging)
+  # on_boot:
+  #   priority: -100
+  #   then:
+  #     - lambda: |-
+  #         Soft_I2C_SetPins(20, 22);
+  #         CHT83XX_SetAlertPin(7);
+  #         CHT83XX_Init();
+  on_boot:
+    - priority: 600 # След инициализация на WiFi, но преди стартиране на логиката
+      then:
+        - script.execute: setup_sensor_script
+
+bk72xx:
+  board: cbu
+
+# external_components:
+#   - source:
+#       type: local
+#       path: components
+
+logger:
+  level: DEBUG
+  # logs:
+  #   sensor: DEBUG
+  #   i2c: DEBUG
+
+# Enable Home Assistant API
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  power_save_mode: LIGHT
+  fast_connect: true
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.110.33
+    gateway: 192.168.110.1
+    subnet: 255.255.255.0
+    dns1: 192.168.110.20
+
+
+# 1. Дефинираме глобални променливи за пиновете
+globals:
+  - id: pin_sda
+    type: int
+    restore_value: no
+    initial_value: '22'
+  - id: pin_scl
+    type: int
+    restore_value: no
+    initial_value: '20'
+
+sensor:
+  - platform: template
+    name: "CHT8310 Temperature"
+    id: temp_sensor
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+  - platform: template
+    name: "CHT8310 Humidity"
+    id: humi_sensor
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+button:
+  - platform: template
+    name: "Force Measurement & Update Limits"
+    on_press:
+      - script.execute: setup_sensor_script
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: P7
+      mode:
+        input: true
+    name: "CHT8310 Alert Input"
+    id: alert_input
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      then:
+        - logger.log: "!!! ALERT PIN TRIGGERED !!!"
+        - script.execute: setup_sensor_script
+
+script:
+  - id: setup_sensor_script
+    then:
+      - lambda: |-
+          using U8 = uint8_t;
+          using U16 = uint16_t;
+          
+          int SDA_PIN = id(pin_sda);
+          int SCL_PIN = id(pin_scl);
+
+          // === Helpers ===
+          auto set_sda_low = [&]() { digitalWrite(SDA_PIN, LOW); pinMode(SDA_PIN, OUTPUT); };
+          auto set_sda_high = [&]() { pinMode(SDA_PIN, INPUT); };
+          auto set_scl_low = [&]() { digitalWrite(SCL_PIN, LOW); pinMode(SCL_PIN, OUTPUT); };
+          auto set_scl_high = [&]() { pinMode(SCL_PIN, INPUT); };
+          auto read_sda = [&]() { return digitalRead(SDA_PIN); };
+          auto delay_sw = [&](U8 t) { delayMicroseconds((unsigned int)20); };
+
+          auto iic_start = [&]() { set_sda_high(); delay_sw(1); set_scl_high(); delay_sw(5); set_sda_low();  delay_sw(5); set_scl_low();  delay_sw(5); };
+          auto iic_stop = [&]() { set_sda_low(); delay_sw(1); set_scl_high(); delay_sw(5); set_sda_high(); delay_sw(5); };
+          auto writex = [&](U8 val) {
+            for (U8 i = 0; i < 8; i++) {
+              if (val & 0x80) set_sda_high(); else set_sda_low();
+              delay_sw(1); set_scl_high(); val <<= 1; delay_sw(5); set_scl_low(); delay_sw(8);
+            }
+          };
+          auto readx = [&]() -> U8 {
+            U8 i, val = 0; set_scl_low(); delay_sw(1); set_sda_high();
+            for (i = 0; i < 8; i++) { set_scl_high(); val = val << 1; if (read_sda() == 1) val |= 0x01; delay_sw(4); set_scl_low(); delay_sw(3); }
+            return val;
+          };
+          auto Check_ACK = [&]() -> bool { bool ack; set_sda_high(); delay_sw(1); set_scl_high(); delay_sw(7); ack = (read_sda() == 1); set_scl_low(); delay_sw(6); return ack; };
+          auto set_ACK = [&](U8 val) { if (val == 1) set_sda_high(); else set_sda_low(); set_scl_high(); delay_sw(7); set_scl_low(); delay_sw(7); };
+
+          auto read_reg = [&](uint8_t adr) -> int16_t {
+            int16_t val = 0; iic_start(); writex(0x80); if (Check_ACK()) { iic_stop(); return 0; }
+            writex(adr);   if (Check_ACK()) { iic_stop(); return 0; }
+            esphome::delayMilliseconds(1); iic_start(); writex(0x81); if (Check_ACK()) { iic_stop(); return 0; }
+            val = readx(); val <<= 8; set_ACK(0); val |= readx(); set_ACK(1); iic_stop(); return val;
+          };
+          
+          auto write_reg = [&](uint8_t adr, int16_t val) {
+            iic_start(); writex(0x80); if (Check_ACK()) { iic_stop(); return; }
+            writex(adr);  if (Check_ACK()) { iic_stop(); return; }
+            writex((val >> 8) & 0xFF); if (Check_ACK()) { iic_stop(); return; }
+            writex(val & 0xFF); if (Check_ACK()) { iic_stop(); return; }
+            iic_stop();
+          };
+
+          // === Logic ===
+          static bool pins_init = false;
+          if (!pins_init) { set_sda_high(); set_scl_high(); pins_init = true; }
+
+          ESP_LOGI("CHT8310", "--- Start Sequence ---");
+
+          // 1. CLEAR INTERRUPT
+          int16_t status = read_reg(0x02);
+          ESP_LOGI("CHT8310", "Status Read: 0x%04X", status);
+
+          // 2. Set Standby + Config
+          // MSB: 0x48 (SD=1, TME=1).
+          // LSB: 0xAA (TME=1, POL=1, SRC=01, FQ=01, ATM=0).
+          // FQ=01 means Fault Queue = 2.
+          // SRC=01 means Temperature Only.
+          ESP_LOGI("CHT8310", "Setting Standby & Config (Queue=2, Source=Temp)...");
+          write_reg(0x03, 0x48AA);
+          
+          // 3. One-Shot Measurement
+          ESP_LOGI("CHT8310", "Triggering One-Shot...");
+          write_reg(0x0F, 0x0000);
+          esphome::delayMilliseconds(150);
+
+          // 4. Read Temperature
+          int16_t temp_raw = read_reg(0x00);
+          float temp_c = (float)temp_raw / 256.0;
+          id(temp_sensor).publish_state(temp_c);
+          ESP_LOGI("CHT8310", "Temp: %.2f C (Raw:%d)", temp_c, temp_raw);
+
+          // 5. Read Humidity
+          int16_t humi_raw = read_reg(0x01);
+          float humi = (float)(humi_raw & 0x7fff) / 32768.0 * 100.0;
+          id(humi_sensor).publish_state(humi);
+          ESP_LOGI("CHT8310", "Humidity: %.1f %%", humi);
+
+          // 6. Set New Limits (+/- 2C)
+          int16_t limit_high = temp_raw + 256; 
+          int16_t limit_low  = temp_raw - 256; // 256 за 1 градус целзий
+          write_reg(0x05, limit_high);
+          write_reg(0x06, limit_low);
+          ESP_LOGI("CHT8310", "Limits Set: High=%d, Low=%d", limit_high, limit_low);
+
+          // 7. Return to Normal Mode
+          // Conv Rate: 5s -> CR=011 -> 0x6000.
+          write_reg(0x04, 0x2000);  /// 60 секунди
+
+          // Config Normal: SD=0. LSB remains 0xAA.
+          write_reg(0x03, 0x08AA);
+
+          // 8. Final Check
+          ESP_LOGI("CHT8310", "Config Read: 0x%04X", read_reg(0x03));
+          ESP_LOGI("CHT8310", "Pin State at end: %d", digitalRead(7));
+          ESP_LOGI("CHT8310", "--- Complete ---");
