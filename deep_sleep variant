@@ -1,0 +1,245 @@
+esphome:
+  name: libretinycht8310
+  on_boot:
+    priority: -10
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: service_button
+          then:
+            - logger.log: "Service Mode - Staying Awake"
+          else:
+            # 1. БАТЕРИЯ
+            - output.turn_on: v_divider_gate
+            - delay: 100ms
+            - component.update: source_adc
+            - component.update: battery_voltage
+            - output.turn_off: v_divider_gate
+
+            # 3. WIFI & SLEEP
+            - wait_until:
+                condition:
+                  wifi.connected:
+                timeout: 15s
+            
+            # 2. СЕНЗОР
+            - script.execute: measure_and_sleep_script
+            - script.wait: measure_and_sleep_script
+            
+            
+            - delay: 4s
+            
+            # 4. ЗАСПИВАНЕ
+            - lambda: |-
+                const uint8_t alert_pin = (1 << 7);
+                 //ESP_LOGI("main", "Configuring Deep Sleep. Wake on GPIO %d (Active High)", alert_pin);
+                //pinMode(7, INPUT_PULLUP);
+                
+                 // Събуждане при HIGH
+                lt_deep_sleep_config_gpio(alert_pin, false);
+                //lt_deep_sleep_config_timer(7200000);       /// контролно събуждане на 2 часа
+                ESP_LOGI("main", "Entering Deep Sleep...");
+                lt_deep_sleep_enter();
+
+bk72xx:
+  board: cbu
+
+api:
+  reboot_timeout: 0s
+  on_client_connected:
+    then:
+      - logger.log: "HA Client connected..."
+
+safe_mode:
+  disabled: true
+
+ota:
+  - platform: esphome
+
+wifi:
+  power_save_mode: LIGHT
+  fast_connect: true
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.110.33
+    gateway: 192.168.110.1
+    subnet: 255.255.255.0
+    dns1: 192.168.110.20
+
+logger:
+  baud_rate: 0
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: P14
+      mode: INPUT_PULLUP
+      inverted: true
+    id: service_button
+    internal: true
+
+  - platform: gpio
+    name: "wake_pin"
+    pin:
+      number: P7
+      mode: INPUT_PULLUP
+    id: service_button_7
+    #internal: true
+
+output:
+  - platform: gpio
+    pin: P8
+    id: v_divider_gate
+
+sensor:
+  - platform: template
+    name: "Temperature"
+    id: temp_val
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: "temperature"
+    state_class: "measurement"
+
+  - platform: template
+    name: "Humidity"
+    id: hum_val
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: "humidity"
+    state_class: "measurement"
+
+  - platform: adc
+    pin: P23
+    id: source_adc
+    update_interval: never
+    internal: true
+
+  - platform: template
+    name: "Battery Voltage"
+    id: battery_voltage
+    unit_of_measurement: "V"
+    device_class: voltage
+    lambda: return id(source_adc).state;
+    filters:
+      - multiply: 2.39
+
+script:
+  - id: measure_and_sleep_script
+    then:
+      - lambda: |-
+          const uint8_t sda = 22; 
+          const uint8_t scl = 20;
+          const uint8_t addr = 0x40;
+
+          // --- I2C Helpers ---
+          auto i2c_start = [&]() {
+            pinMode(sda, OUTPUT); digitalWrite(sda, HIGH);
+            pinMode(scl, OUTPUT); digitalWrite(scl, HIGH);
+            esphome::delayMicroseconds(10);
+            digitalWrite(sda, LOW);
+            esphome::delayMicroseconds(10);
+            digitalWrite(scl, LOW);
+          };
+          auto i2c_stop = [&]() {
+            pinMode(sda, OUTPUT); digitalWrite(sda, LOW);
+            esphome::delayMicroseconds(10);
+            digitalWrite(scl, HIGH);
+            esphome::delayMicroseconds(10);
+            digitalWrite(sda, HIGH);
+            pinMode(sda, INPUT); pinMode(scl, INPUT);
+          };
+          auto i2c_write = [&](uint8_t byte) {
+            for (int i = 0; i < 8; i++) {
+              pinMode(sda, OUTPUT);
+              digitalWrite(sda, (byte & 0x80) ? HIGH : LOW);
+              byte <<= 1;
+              esphome::delayMicroseconds(10);
+              digitalWrite(scl, HIGH); esphome::delayMicroseconds(10);
+              digitalWrite(scl, LOW);
+            }
+            pinMode(sda, INPUT_PULLUP); esphome::delayMicroseconds(10);
+            digitalWrite(scl, HIGH); bool ack = !digitalRead(sda);
+            esphome::delayMicroseconds(10);
+            digitalWrite(scl, LOW);
+            return ack;
+          };
+          auto i2c_read = [&](bool ack) {
+            uint8_t byte = 0;
+            pinMode(sda, INPUT_PULLUP);
+            for (int i = 0; i < 8; i++) {
+              esphome::delayMicroseconds(10);
+              digitalWrite(scl, HIGH); esphome::delayMicroseconds(10);
+              if(digitalRead(sda)) byte |= (1 << (7 - i));
+              digitalWrite(scl, LOW);
+            }
+            esphome::delayMicroseconds(10);
+            pinMode(sda, OUTPUT);
+            digitalWrite(sda, ack ? LOW : HIGH);
+            digitalWrite(scl, HIGH); esphome::delayMicroseconds(10);
+            digitalWrite(scl, LOW);
+            return byte;
+          };
+          auto i2c_write_reg16 = [&](uint8_t reg, int16_t value) {
+            i2c_start(); i2c_write(addr << 1); i2c_write(reg);
+            i2c_write((uint8_t)(value >> 8)); i2c_write((uint8_t)(value & 0xFF));
+            i2c_stop();
+          };
+
+          // --- Measurement ---
+          uint8_t buff[4] = {0, 0, 0, 0};
+          
+          // One Shot
+          i2c_start(); i2c_write(addr << 1); i2c_write(0x0F); i2c_write(0x00); i2c_write(0x00); i2c_stop();
+          esphome::delayMicroseconds(20000);
+
+          // Read Temp
+          i2c_start(); i2c_write(addr << 1); i2c_write(0x00); i2c_stop();
+          i2c_start(); i2c_write((addr << 1) | 1);
+          buff[0] = i2c_read(true); buff[1] = i2c_read(false); i2c_stop();
+
+          // Read Hum
+          i2c_start(); i2c_write(addr << 1); i2c_write(0x01); i2c_stop();
+          i2c_start(); i2c_write((addr << 1) | 1);
+          buff[2] = i2c_read(true); buff[3] = i2c_read(false); i2c_stop();
+
+          // Publish
+          int16_t temp_raw = (int16_t)(buff[0] << 8 | buff[1]);
+          float t_final = (float)(temp_raw >> 3) * 0.03125f;
+          id(temp_val).publish_state(t_final);
+
+          int16_t hum_raw = (int16_t)(buff[2] << 8 | buff[3]);
+          float h_final = (((float)(hum_raw & 0x7FFF) / 32768.0f) * 100.0f);
+          id(hum_val).publish_state(h_final);
+
+          ESP_LOGI("main", "Measured: T=%.2f, H=%.1f", t_final, h_final);
+
+          // --- Configure ALERT & RATE ---
+          
+          // 1. Conversion Rate Register (0x04)
+          // Set to 1 second (CR=100 binary = 0x04 in MSB)
+          // Table 7: 100 = 1s. We write 0x0400 (MSB=0x04, LSB=0x00), 0x0200 10 s, 0x0100 60s, 
+          i2c_write_reg16(0x04, 0x0100); 
+          
+          // 2. Limits
+          float t_diff = 2.0f;
+          int16_t t_high = (int16_t)((t_final + t_diff) / 0.03125f) << 3;
+          int16_t t_low  = (int16_t)((t_final - t_diff) / 0.03125f) << 3;
+          
+          i2c_write_reg16(0x05, t_high); // Temp High Limit
+          i2c_write_reg16(0x06, t_low);  // Temp Low Limit
+
+          // 3. Config Register (0x03)
+          // MSB: 0x08 (Normal Mode)
+          // LSB: 0x89 (Active Low, Temp Only, 1 faults, Comparator)
+          // Binary: 10    0          0 1          00        0
+          // POL=0 (Active Low) - За да работи с вътрешния PULL-UP на чипа. 
+          i2c_start();
+          i2c_write(addr << 1);
+          i2c_write(0x03); 
+          i2c_write(0x08); 
+          i2c_write(0x89); 
+          i2c_stop();
+
+          ESP_LOGI("main", "Config Done: Rate=1s, Alert=Active High, Limits set.");
