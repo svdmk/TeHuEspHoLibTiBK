@@ -8,12 +8,28 @@
 #define REG_GPIO_CFG_P22      (REG_GPIO_BASE + 22 * 4)
 #define REG_GPIO_DATA_INPUT   (REG_GPIO_BASE + 0x43 * 4)
 
+// Пример: конфигуриране на пин 20 като вход с pull-up
+// В BK7231N, GPIO_CFG регистрите обикновено имат следния формат:
+// [2:0] - функция (000=вход, 001=изход, 010=алтернативна функция и т.н.)
+// [4:3] - pull-up/pull-down (00=без, 01=pull-up, 10=pull-down)
+
+//volatile uint32_t* p20_cfg = (volatile uint32_t*)REG_GPIO_CFG_P20;
+//*p20_cfg = (0 << 0) |    // режим: вход (0)
+           (1 << 3);     // pull-up включен
+
 // BK7231N GPIO Config: Bit0=OutputEnable, Bit2=PullUp, Bit3=OutputVal
 // SDA_HIGH поставя пина във входящ режим с Pull-up (High-Z)
 #define SDA_HIGH() *((volatile uint32_t*)REG_GPIO_CFG_P22) = 0x04 
 #define SDA_LOW()  *((volatile uint32_t*)REG_GPIO_CFG_P22) = 0x01 // Output Enable (Val 0)
 #define SCL_HIGH() *((volatile uint32_t*)REG_GPIO_CFG_P20) = 0x04 
 #define SCL_LOW()  *((volatile uint32_t*)REG_GPIO_CFG_P20) = 0x01
+
+
+// Прочитаме всички входни пинове
+//uint32_t all_inputs = *(volatile uint32_t*)REG_GPIO_DATA_INPUT;
+
+// Проверяваме конкретен пин (например пин 20)
+//bool pin20_state = (all_inputs >> 20) & 0x1;
 
 // Директна проверка на 22-ри бит в регистъра за данни
 #define SDA_READ() ((*((volatile uint32_t*)REG_GPIO_DATA_INPUT) >> 22) & 0x01)
